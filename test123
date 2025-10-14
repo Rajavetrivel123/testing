@@ -1,0 +1,137 @@
+properties([
+  parameters([
+
+    // === REGION Parameter ===
+    string(name: 'region',
+           defaultValue: 'ap-south-1',
+           description: 'Enter AWS region'),
+
+    // === VPC Association (User gives VPC IDs only) ===
+    [$class: 'DynamicReferenceParameter',
+      name: 'vpc_association',
+      description: 'Enter VPC IDs (comma separated). Region will be attached automatically.',
+      choiceType: 'PT_TEXTBOX',
+      omitValueField: false,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: '''
+              def vpcList = ["vpc-0a111111","vpc-0b222222","vpc-0c333333"]
+              return vpcList
+          '''
+        ]
+      ]
+    ],
+
+    // === Routing Policy ===
+    [$class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Select Route53 Routing Policy',
+      name: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: 'return ["simple", "weighted", "failover"]'
+        ]
+      ]
+    ],
+
+    // === Simple Record Parameter ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_TEXTBOX',
+      description: '''
+Enter Simple record(s) as Terraform-style list:
+[{ name = "rds-sim", ttl = 300, type = "CNAME", value = "endpoint-1" },
+ { name = "rds-sim", ttl = 300, type = "CNAME", value = "endpoint-2" }]
+      ''',
+      name: 'simple_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: true, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: '''
+              if (routing_policy == "simple") {
+                  return ['[{ name = "rds-sim", ttl = 300, type = "CNAME", value = "endpoint" }]']
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ],
+
+    // === Weighted Record Parameter ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_TEXTBOX',
+      description: '''
+Enter Weighted record(s) as Terraform-style list (minimum 2 required):
+[{ name = "rds-weight", ttl = 300, type = "CNAME", value = "endpoint-1", set_id = "set1", weight = 100 },
+ { name = "rds-weight", ttl = 300, type = "CNAME", value = "endpoint-2", set_id = "set2", weight = 50 }]
+      ''',
+      name: 'weighted_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: true, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: '''
+              if (routing_policy == "weighted") {
+                  return ['[{ name = "rds-weight", ttl = 300, type = "CNAME", value = "endpoint-1", set_id = "set1", weight = 100 }, { name = "rds-weight", ttl = 300, type = "CNAME", value = "endpoint-2", set_id = "set2", weight = 50 }]']
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ],
+
+    // === Failover Record Parameter ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_TEXTBOX',
+      description: '''
+Enter Failover record(s) as Terraform-style list:
+[{ name = "rds-fail", ttl = 300, type = "CNAME", value = "endpoint", failover = "PRIMARY", fqdn = "xyz", set_id = "failover-primary" },
+ { name = "rds-fail", ttl = 300, type = "CNAME", value = "endpoint2", failover = "SECONDARY", fqdn = "abc", set_id = "failover-secondary" }]
+      ''',
+      name: 'failover_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: true, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: '''
+              if (routing_policy == "failover") {
+                  return ['[{ name = "rds-fail", ttl = 300, type = "CNAME", value = "endpoint", failover = "PRIMARY", fqdn = "xyz", set_id = "failover-primary" }, { name = "rds-fail", ttl = 300, type = "CNAME", value = "endpoint2", failover = "SECONDARY", fqdn = "abc", set_id = "failover-secondary" }]']
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ]
+  ])
+])
+
+
+region → simple string param
+
+vpc_association → user gives list of VPCs like ["vpc-0bdef23", "vpc-03a5bc45"]
+→ later in your Jenkinsfile, you can format it as:
+
+def vpc_output = vpc_association.split(',').collect { vpc -> "{ vpc_id = \"${vpc.trim()}\", region = \"${region}\" }" }
+
+
+So it becomes:
+
+[{ vpc_id = "vpc-0bdef23", region = "ap-south-1" }, { vpc_id = "vpc-03a5bc45", region = "ap-south-
