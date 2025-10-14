@@ -1,0 +1,135 @@
+properties([
+  parameters([
+
+    // === REGION Parameter ===
+    string(
+      name: 'region',
+      defaultValue: 'ap-south-1',
+      description: 'Enter AWS region (used internally)'
+    ),
+
+    // === VPC Association (User enters VPC IDs only) ===
+    [$class: 'DynamicReferenceParameter',
+      name: 'vpc_association',
+      description: '''
+Enter VPC IDs as Terraform-style list (example):
+["vpc-0bdef23", "vpc-03a5bc45"]
+      ''',
+      choiceType: 'PT_TEXTBOX',
+      omitValueField: false,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: '''
+              // User must manually input Terraform-style array
+              return ['["vpc-0a111111","vpc-0b222222"]']
+          '''
+        ]
+      ]
+    ],
+
+    // === Routing Policy ===
+    [$class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Select Route53 Routing Policy',
+      name: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: 'return ["simple", "weighted", "failover"]'
+        ]
+      ]
+    ],
+
+    // === Simple Record Parameter ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_TEXTBOX',
+      description: '''
+Enter Simple record(s) as Terraform-style list:
+[
+  { name = "rds-sim", ttl = 300, type = "CNAME", value = "endpoint-1" },
+  { name = "rds-sim", ttl = 300, type = "CNAME", value = "endpoint-2" }
+]
+      ''',
+      name: 'simple_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: true, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: '''
+              if (routing_policy == "simple") {
+                  return ['[{ name = "rds-sim", ttl = 300, type = "CNAME", value = "endpoint" }]']
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ],
+
+    // === Weighted Record Parameter ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_TEXTBOX',
+      description: '''
+Enter Weighted record(s) as Terraform-style list (minimum 2 required):
+[
+  { name = "rds-weight", ttl = 300, type = "CNAME", value = "endpoint-1", set_id = "set1", weight = 100 },
+  { name = "rds-weight", ttl = 300, type = "CNAME", value = "endpoint-2", set_id = "set2", weight = 50 }
+]
+      ''',
+      name: 'weighted_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: true, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: '''
+              if (routing_policy == "weighted") {
+                  return ['[{ name = "rds-weight", ttl = 300, type = "CNAME", value = "endpoint-1", set_id = "set1", weight = 100 }, { name = "rds-weight", ttl = 300, type = "CNAME", value = "endpoint-2", set_id = "set2", weight = 50 }]']
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ],
+
+    // === Failover Record Parameter ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_TEXTBOX',
+      description: '''
+Enter Failover record(s) as Terraform-style list:
+[
+  { name = "rds-fail", ttl = 300, type = "CNAME", value = "endpoint-1", failover = "PRIMARY", fqdn = "xyz", set_id = "failover-primary" },
+  { name = "rds-fail", ttl = 300, type = "CNAME", value = "endpoint-2", failover = "SECONDARY", fqdn = "abc", set_id = "failover-secondary" }
+]
+      ''',
+      name: 'failover_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: true, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: true,
+          script: '''
+              if (routing_policy == "failover") {
+                  return ['[{ name = "rds-fail", ttl = 300, type = "CNAME", value = "endpoint-1", failover = "PRIMARY", fqdn = "xyz", set_id = "failover-primary" }, { name = "rds-fail", ttl = 300, type = "CNAME", value = "endpoint-2", failover = "SECONDARY", fqdn = "abc", set_id = "failover-secondary" }]']
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ]
+  ])
+])
