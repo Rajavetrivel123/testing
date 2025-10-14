@@ -1,0 +1,115 @@
+parameters([
+
+    // --- VPC Associations ---
+    [$class: 'DynamicReferenceParameter',
+        name: 'vpc_associations',
+        description: 'Select VPC ID (region auto-attached). Returns list of {vpc_id, region}',
+        choiceType: 'PT_MULTI_SELECT',
+        omitValueField: false,
+        script: [
+            $class: 'GroovyScript',
+            script: [
+                classpath: [],
+                sandbox: true,
+                script: '''
+                    def vpcRegionMap = [
+                        "vpc-04dde44":"us-east-1",
+                        "vpc-0bdef23":"ap-south-1"
+                    ]
+                    return vpcRegionMap.collect { vpc, region ->
+                        "{vpc_id='${vpc}', region='${region}'}"
+                    }
+                '''
+            ]
+        ]
+    ],
+
+properties([
+  parameters([
+    // === Routing Policy Selection ===
+    [$class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Select Route53 Routing Policy',
+      name: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        script: [classpath: [], sandbox: false, script: 'return ["simple", "weighted", "failover"]']
+      ]
+    ],
+
+    // === Simple Record Parameters ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Enter Simple Record details (name, type, value, ttl)',
+      name: 'simple_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: false, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: false,
+          script: '''
+              if (routing_policy == "simple") {
+                  return ["{name='rds-sim', ttl=300, type='CNAME', value='endpoint'}"]
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ],
+
+    // === Weighted Record Parameters ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      description: 'Enter Weighted Record details (name, ttl, type, value, set_id, weight)',
+      name: 'weighted_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: false, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: false,
+          script: '''
+              if (routing_policy == "weighted") {
+                  return [
+                      "{name='rds-weight', ttl=300, type='CNAME', value='endpoint', set_id='set1', weight=100}",
+                      "{name='rds-weight', ttl=300, type='CNAME', value='endpoint2', set_id='set2', weight=50}"
+                  ]
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ],
+
+    // === Failover Record Parameters ===
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_MULTI_SELECT',
+      description: 'Enter Failover Record details (primary/secondary)',
+      name: 'failover_records',
+      referencedParameters: 'routing_policy',
+      script: [
+        $class: 'GroovyScript',
+        fallbackScript: [classpath: [], sandbox: false, script: 'return [""]'],
+        script: [
+          classpath: [],
+          sandbox: false,
+          script: '''
+              if (routing_policy == "failover") {
+                  return [
+                      "{name='rds-fail', ttl=300, type='CNAME', value='endpoint', failover='PRIMARY', fqdn='xyz', set_id='failover-primary'}",
+                      "{name='rds-fail', ttl=300, type='CNAME', value='endpoint', failover='SECONDARY', fqdn='abc', set_id='failover-secondary'}"
+                  ]
+              } else {
+                  return [""]
+              }
+          '''
+        ]
+      ]
+    ]
+  ])
+])
