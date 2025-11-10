@@ -1,0 +1,82 @@
+import boto3
+import json
+import logging
+import traceback
+from src.main.python.s3_srv import S3Service  #Import S3 service
+
+logger = logging.getLogger(__name__)
+
+class DynamoDBService:
+    def __init__(self, client, session):
+        """
+        Initialize DynamoDB service.
+        """
+        self._client = client
+        self._session = session
+        logger.info(f"DynamoDB client connected to Region: {self._client.meta.region_name}")
+
+
+
+
+
+
+def restore_mrsc(self, args):
+        """
+        Restore MRSC-enabled DynamoDB table using data exported to S3.
+        S3 operations are delegated to S3Service.
+        """
+
+        # --- Input arguments ---
+        region = args.region
+        s3_bucket = args.s3_bucket
+        s3_prefix = args.s3_prefix
+        target_table_name = args.target_table
+        file_ext = args.file_extension
+
+        logger.info(f"Starting MRSC restore for table: {target_table_name}")
+        logger.info(f"Bucket: {s3_bucket}, Prefix: {s3_prefix}, Region: {region}")
+
+        try:
+            # Create service sessions
+            session = boto3.session.Session(region_name=region)
+            s3_client = session.client('s3')
+            s3_service = S3Service(s3_client, session)
+
+            dynamodb = boto3.resource('dynamodb', region_name=region)
+            table = dynamodb.Table(target_table_name)
+
+            # List exported files from S3
+            files = s3_service.list_export_files(s3_bucket, s3_prefix, file_ext)
+            if not files:
+                logger.warning("No files found to restore, exiting restore process.")
+                return
+
+            # Process each file
+            for file_key in files:
+                logger.info(f"📥 Restoring file: {file_key}")
+                data_str = s3_service.get_file_content(s3_bucket, file_key, file_ext)
+                if not data_str:
+                    logger.warning(f"Skipping empty or unreadable file: {file_key}")
+                    continue
+
+                try:
+                    data = json.loads(data_str)
+                    items = data if isinstance(data, list) else data.get("Items", [])
+
+                    with table.batch_writer() as batch:
+                        for item in items:
+                            batch.put_item(Item=item)
+
+                    logger.info(f"Restored {len(items)} items from file: {file_key}")
+
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON Decode error in {file_key}: {e}")
+                except Exception as e:
+                    logger.error(f"Error writing data from {file_key}: {e}")
+                    traceback.print_exc()
+
+            logger.info(f"MRSC restore process completed successfully for {target_table_name}")
+
+        except Exception as e:
+            logger.error(f"Unexpected error during MRSC restore: {e}")
+            traceback.print_exc()
