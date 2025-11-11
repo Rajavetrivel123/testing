@@ -1,0 +1,446 @@
+Nice — thank you for the screenshots. I can see your working single-file script and the exact flow you tested locally (paginator for listing `.json.gz`, reading gzip from S3 body, deserializing with `TypeDeserializer`, batch-writes, checkpointing, thread pool and retry).
+
+Below I’ve done what your manager asked: I split that working script into clean, manager-approved modules while keeping the exact tested logic and behaviour. I included:
+
+* `src/main/python/s3_srv.py` — S3-only operations (list files, get S3 object body)
+* `src/main/python/dynamodb_srv.py` — DynamoDB restore logic (deserialise, batch-write, checkpoint, parallel processing, retry)
+* `src/main/python/argument_manager.py` — arguments for `restore-mrsc`
+* `src/main/python/command_manager.py` — command registration (minimal mapping for restore-mrsc)
+
+I kept semantics and defaults you used (gzip handling, batch_writer, TypeDeserializer), added explicit re-raising of critical errors so the CI/pipeline fails on real failures, and preserved the checkpoint / parallel structure.
+
+Copy these four files into your project (paths as above). I used the same logging and boto3 patterns shown in your screenshots.
+
+---
+
+## 1) `src/main/python/s3_srv.py`
+
+S3 service only: list files with paginator and provide object body stream.
+
+```python
+# src/main/python/s3_srv.py
+import logging
+import traceback
+
+logger = logging.getLogger(__name__)
+
+class S3Service:
+    def __init__(self, session):
+        """
+        S3Service owns only S3 actions. Provide a boto3.Session instance.
+        """
+        self._session = session
+        self._client = session.client('s3')
+        logger.info(f"S3Service initialized for region: {getattr(self._client.meta, 'region_name', 'unknown')}")
+
+    def list_json_gz_files(self, bucket, prefix):
+        """
+        List .json.gz (and .json) files under the given prefix using a paginator.
+        Returns list of full keys.
+        """
+        try:
+            paginator = self._client.get_paginator('list_objects_v2')
+            page_iterator = paginator.paginate(Bucket=bucket, Prefix=prefix)
+            files = []
+            for page in page_iterator:
+                for obj in page.get('Contents', []):
+                    key = obj.get('Key')
+                    if not key:
+                        continue
+                    if key.endswith('.json.gz') or key.endswith('.json'):
+                        files.append(key)
+            logger.info(f"Found {len(files)} json(.gz) files in s3://{bucket}/{prefix}")
+            return files
+        except Exception as e:
+            logger.error(f"Error listing s3 objects: {e}")
+            traceback.print_exc()
+            # re-raise so caller can decide to fail
+            raise
+
+    def get_object_body(self, bucket, key):
+        """
+        Return the streaming body for a given s3 object.
+        Caller is responsible for reading/decompressing.
+        """
+        try:
+            resp = self._client.get_object(Bucket=bucket, Key=key)
+            return resp['Body']   # StreamingBody
+        except Exception as e:
+            logger.error(f"Error fetching S3 object {key} from bucket {bucket}: {e}")
+            traceback.print_exc()
+            raise
+```
+
+---
+
+## 2) `src/main/python/dynamodb_srv.py`
+
+DynamoDB restore logic. Uses `S3Service` for S3. Includes deserialization, batch writes, checkpointing, retry and parallel processing (ThreadPoolExecutor). This matches your tested script.
+
+```python
+# src/main/python/dynamodb_srv.py
+import boto3
+import json
+import gzip
+import logging
+import os
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from botocore.exceptions import ClientError, NoCredentialsError
+from boto3.dynamodb.types import TypeDeserializer
+
+from src.main.python.s3_srv import S3Service
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Defaults (you may override via args)
+DEFAULT_BATCH_SIZE = 100
+DEFAULT_MAX_WORKERS = 3
+DEFAULT_CHECKPOINT_FILE = "restore_checkpoints.txt"
+
+deserializer = TypeDeserializer()
+
+def deserialize_item(dynamo_json):
+    """
+    Convert a DynamoDB wire-format attribute map into normal python dict.
+    Example: {'pk': {'S': '1'}, 'count': {'N': '10'}} -> {'pk':'1', 'count':10}
+    """
+    return {k: deserializer.deserialize(v) for k, v in dynamo_json.items()}
+
+
+class DynamoDBService:
+    def __init__(self, session):
+        """
+        session: boto3.Session (region-aware)
+        """
+        self._session = session
+        self._dynamodb = session.resource('dynamodb')
+        logger.info(f"DynamoDBService initialized for region: {getattr(session, 'region_name', 'unknown')}")
+
+    # --- helper functions for checkpointing ---
+    @staticmethod
+    def load_checkpoint(checkpoint_file):
+        processed = set()
+        if os.path.exists(checkpoint_file):
+            with open(checkpoint_file, "r") as f:
+                for line in f:
+                    processed.add(line.strip())
+        return processed
+
+    @staticmethod
+    def update_checkpoint(checkpoint_file, file_key):
+        with open(checkpoint_file, "a") as f:
+            f.write(file_key + "\n")
+
+    # --- reading items from a gzip json file stored in S3 ---
+    def read_items_from_json_gz(self, body_stream):
+        """
+        body_stream: StreamingBody returned by s3.get_object(...)[ 'Body' ]
+        This reads the full body, decompresses and returns list of JSON items (one per line)
+        (this matches your local test behaviour).
+        """
+        try:
+            with gzip.GzipFile(fileobj=body_stream) as gz:
+                data = gz.read().decode("utf-8")
+            # each line is JSON; skip empty lines
+            lines = [ln for ln in data.strip().split("\n") if ln.strip()]
+            items = [json.loads(line) for line in lines]
+            return items
+        except Exception:
+            # not gz? attempt to decode as plain json (single array or newline json)
+            try:
+                body_stream.seek(0)
+            except Exception:
+                pass
+            try:
+                raw = body_stream.read().decode("utf-8")
+                # if it's a JSON array
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return parsed
+                # else try newline json
+                return [json.loads(line) for line in raw.strip().split("\n") if line.strip()]
+            except Exception as e:
+                logger.error(f"Failed to read/decompress/parse body: {e}")
+                traceback.print_exc()
+                raise
+
+    def import_items_to_dynamodb(self, table, items, batch_size=DEFAULT_BATCH_SIZE):
+        """
+        Write items (list of dynamo-wire-format records, or {'Item': {...}}) using batch_writer.
+        We accept same format as your working script where each raw_item may contain key 'Item'.
+        """
+        total_written = 0
+        try:
+            # chunk
+            for i in range(0, len(items), batch_size):
+                batch_items = items[i:i + batch_size]
+                with table.batch_writer() as batch:
+                    for raw_item in batch_items:
+                        try:
+                            # if item already is raw attribute map under 'Item', follow your script
+                            if isinstance(raw_item, dict) and 'Item' in raw_item:
+                                item = deserialize_item(raw_item['Item'])
+                            else:
+                                # if the exported item is already plain JSON attribute map (no Dynamo types)
+                                item = raw_item
+                            batch.put_item(Item=item)
+                            total_written += 1
+                        except KeyError:
+                            logger.error(f"Missing 'Item' key in record: {raw_item}")
+                        except Exception as e:
+                            logger.error(f"Error inserting item {raw_item}: {e}")
+                            raise
+        except Exception:
+            logger.error("Batch write failed.")
+            traceback.print_exc()
+            raise
+        return total_written
+
+    def process_file(self, s3_service, s3_bucket, file_key, table, file_ext, checkpoint_file, retry_on_fail=True):
+        """
+        Process single S3 file:
+         - get body using s3_service
+         - read and parse items (gz or json)
+         - import to dynamodb
+         - update checkpoint
+        On error, optionally attempt one retry (recreate session and s3_service).
+        """
+        try:
+            body = s3_service.get_object_body(s3_bucket, file_key)
+            # body is a StreamingBody; pass to reader
+            items = self.read_items_from_json_gz(body)
+            if not items:
+                logger.warning(f"No items found in {file_key}; skipping.")
+                return 0
+            written = self.import_items_to_dynamodb(table, items)
+            logger.info(f"Restored {written} items from {file_key}")
+            self.update_checkpoint(checkpoint_file, file_key)
+            return written
+        except Exception as e:
+            logger.warning(f"Error occurred while processing {file_key}: {e}.")
+            traceback.print_exc()
+            if retry_on_fail:
+                logger.info("Attempting retry once after short sleep...")
+                time.sleep(5)
+                # recreate session & s3_service to refresh credentials and retry
+                new_session = boto3.session.Session(region_name=self._session.region_name)
+                new_s3_service = S3Service(new_session)
+                try:
+                    body = new_s3_service.get_object_body(s3_bucket, file_key)
+                    items = self.read_items_from_json_gz(body)
+                    written = self.import_items_to_dynamodb(table, items)
+                    logger.info(f"(Retry) Restored {written} items from {file_key}")
+                    self.update_checkpoint(checkpoint_file, file_key)
+                    return written
+                except Exception as e2:
+                    logger.error(f"Retry failed for file {file_key}: {e2}")
+                    traceback.print_exc()
+                    raise
+            else:
+                raise
+
+    def restore_mrsc(self,
+                     region,
+                     s3_bucket,
+                     s3_prefix,
+                     target_table_name,
+                     file_extension=".json.gz",
+                     checkpoint_file=DEFAULT_CHECKPOINT_FILE,
+                     batch_size=DEFAULT_BATCH_SIZE,
+                     max_workers=DEFAULT_MAX_WORKERS):
+        """
+        High-level restore operation—keeps the same flow as your local script.
+        """
+        # create S3 service with provided session's region
+        s3_service = S3Service(self._session)
+
+        # get DynamoDB table handle
+        table = self._dynamodb.Table(target_table_name)
+
+        # load checkpointed processed files
+        processed_files = self.load_checkpoint(checkpoint_file)
+        logger.info(f"Already processed files count: {len(processed_files)}")
+
+        # list files
+        files = s3_service.list_json_gz_files(s3_bucket, s3_prefix)
+        # filter out processed
+        files_to_process = [k for k in files if k not in processed_files]
+
+        if not files_to_process:
+            logger.warning("No new files to process. Exiting with error to surface to pipeline (change if you prefer OK).")
+            # raise so pipeline fails if your desired behaviour is to fail on nothing to restore
+            raise RuntimeError("No files to process for MRSC restore.")
+
+        logger.info(f"Processing {len(files_to_process)} files with {max_workers} workers...")
+
+        # parallel processing using threadpool (matches your local approach)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self.process_file, s3_service, s3_bucket, key, table, file_extension, checkpoint_file): key
+                       for key in files_to_process}
+
+            for fut in as_completed(futures):
+                key = futures[fut]
+                try:
+                    result = fut.result()
+                    logger.info(f"Finished {key} -> {result} items")
+                except Exception as e:
+                    logger.error(f"Error processing file {key}: {e}")
+                    # raise to ensure pipeline fails instead of continuing silently
+                    raise
+
+        logger.info("MRSC restore completed successfully.")
+```
+
+**Notes on settings & behaviour:**
+
+* By default `restore_mrsc()` raises `RuntimeError` when there are no new files to process. Change if you want a passive success.
+* The code retries each file once after a short sleep and session refresh (matching your local script that attempted a "session refresh").
+* We preserve chunking and batch_writer logic; use `TypeDeserializer` for DynamoDB wire-format items.
+
+---
+
+## 3) `src/main/python/argument_manager.py`
+
+Add register function for CLI arguments (matches your earlier style).
+
+```python
+# src/main/python/argument_manager.py
+def register_restore_mrsc_arguments(parser):
+    group = parser.add_argument_group('Restore MRSC Options')
+    group.add_argument('--region', type=str, required=True,
+                       help='AWS region where the MRSC table exists')
+    group.add_argument('--s3-bucket', type=str, required=True,
+                       help='S3 bucket containing export files')
+    group.add_argument('--s3-prefix', type=str, required=True,
+                       help='S3 prefix path for exported files')
+    group.add_argument('--target-table', type=str, required=True,
+                       help='Target MRSC-enabled DynamoDB table name')
+    group.add_argument('--file-extension', type=str, default='.json.gz',
+                       help='File extension (default: .json.gz)')
+    group.add_argument('--checkpoint-file', type=str, default='restore_checkpoints.txt',
+                       help='Local checkpoint file path')
+    group.add_argument('--batch-size', type=int, default=100,
+                       help='DynamoDB batch size per request')
+    group.add_argument('--max-workers', type=int, default=3,
+                       help='Number of parallel threads to use')
+```
+
+---
+
+## 4) `src/main/python/command_manager.py`
+
+Minimal entries to map command to argument registration (adapt to your existing file structure as needed):
+
+```python
+# src/main/python/command_manager.py
+from src.main.python.argument_manager import register_restore_mrsc_arguments
+
+class Command:
+    DDB_RESTORE_MRSC = 'restore-mrsc'
+
+REGISTER_ARGUMENTS_MAP = {
+    Command.DDB_RESTORE_MRSC: register_restore_mrsc_arguments
+}
+```
+
+You will also need to ensure your main runner maps the command to calling DynamoDBService.restore_mrsc with parsed args. Example (if you need full `main.py` snippet):
+
+```python
+# example main runner snippet (not full file)
+import argparse
+import boto3
+import sys
+from src.main.python.command_manager import Command
+from src.main.python.dynamodb_srv import DynamoDBService
+
+parser = argparse.ArgumentParser()
+# register arguments for the command
+from src.main.python.argument_manager import register_restore_mrsc_arguments
+register_restore_mrsc_arguments(parser)
+args = parser.parse_args()
+
+try:
+    session = boto3.session.Session(region_name=args.region)
+    ddb_service = DynamoDBService(session)
+    ddb_service.restore_mrsc(
+        region=args.region,
+        s3_bucket=args.s3_bucket,
+        s3_prefix=args.s3_prefix,
+        target_table_name=args.target_table,
+        file_extension=args.file_extension,
+        checkpoint_file=args.checkpoint_file,
+        batch_size=args.batch_size,
+        max_workers=args.max_workers
+    )
+except Exception as e:
+    print(f"Fatal error: {e}")
+    sys.exit(1)
+```
+
+---
+
+## Quick explanation of how the pieces map to your original working script
+
+From your screenshots I saw this flow:
+
+1. create_session() → boto3 Session, s3 client, dynamodb resource/table
+   → In new design we create a `boto3.session.Session` once and pass it to `DynamoDBService`, which uses the same session for S3Service as required.
+
+2. list_json_gz_files() — paginator used to collect `.json.gz` files
+   → Implemented in `S3Service.list_json_gz_files`.
+
+3. read_items_from_json_gz() — decompress and `json.loads` each line to produce items
+   → Implemented as `DynamoDBService.read_items_from_json_gz` (keeps S3 class S3-only and Dynamo class does parsing)
+
+4. import_items_to_dynamodb() — batches using `table.batch_writer()` and `TypeDeserializer`
+   → Implemented in `DynamoDBService.import_items_to_dynamodb` using `TypeDeserializer` (same as your code).
+
+5. checkpointing — keep already processed keys in a file, skip them later
+   → Implemented with `load_checkpoint` & `update_checkpoint`.
+
+6. parallel execution with `ThreadPoolExecutor` and retry logic
+   → Implemented in `restore_mrsc` and `process_file` with one retry and session refresh.
+
+---
+
+## How to run (same as your tested command)
+
+Example (if you use main runner snippet above):
+
+```bash
+python main.py restore-mrsc \
+  --region us-east-1 \
+  --s3-bucket my-bucket \
+  --s3-prefix exports/2025/07/ \
+  --target-table my-mrsc-table \
+  --file-extension .json.gz \
+  --checkpoint-file restore_checkpoints.txt \
+  --batch-size 100 \
+  --max-workers 3
+```
+
+---
+
+## Important operational notes (read carefully)
+
+1. **Credentials** — make sure the process (Docker/container or host) has AWS credentials available (IAM role on instance/ECS task, or environment variables, or use the STS assume-role helper I can add if you need cross-account roles). If credentials are missing you’ll get `NoCredentialsError`. You can add an assume-role step if required.
+
+2. **Memory** — we read file contents in memory for each file (matching your working script). If your S3 files are huge, you should stream process line-by-line to avoid memory pressure.
+
+3. **Pipeline fail behaviour** — I re-raise exceptions on critical failures and made `main.py` exit non-zero when catching exception, so CI will fail if any critical error occurs (as you requested).
+
+4. **Small differences you can tweak** — whether `restore_mrsc()` should treat "no files found" as success or failure. I implemented it to raise to surface the condition to the pipeline. Change if you prefer quiet success.
+
+---
+
+## Next steps I can do for you now (pick one)
+
+* (A) Add **STS assume-role** code to `DynamoDBService` / `S3Service` so each service can use a different role (common in cross-account setups).
+* (B) Produce a full `main.py` integrated with your `command_manager.py` and an example `Dockerfile` snippet to ensure `aws`/boto3 are present.
+* (C) Convert `read_items_from_json_gz` to stream-line parsing (low memory) if your files are very big.
+* (D) Paste your exact `main.py` or `command_manager.py` and I’ll integrate this code into them so you can drop in and run immediately.
+
+Tell me which one you want next and I’ll produce it right away.
