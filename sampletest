@@ -1,0 +1,265 @@
+s3 :
+
+# src/main/python/s3_srv.py
+import logging
+import traceback
+
+logger = logging.getLogger(__name__)
+
+
+class S3Service:
+    def __init__(self, session):
+        """
+        S3Service uses a boto3.Session instance (assumed-role or local session).
+        """
+        self._session = session
+        self._client = session.client("s3")
+        logger.info(f"S3Service initialized for region: {getattr(self._client.meta, 'region_name', 'unknown')}")
+
+    def list_json_gz_files(self, bucket, prefix):
+        """
+        Return list of keys under prefix that end with .json.gz or .json
+        """
+        try:
+            paginator = self._client.get_paginator("list_objects_v2")
+            page_iterator = paginator.paginate(Bucket=bucket, Prefix=prefix)
+            files = []
+            for page in page_iterator:
+                for obj in page.get("Contents", []):
+                    key = obj.get("Key")
+                    if not key:
+                        continue
+                    if key.endswith(".json.gz") or key.endswith(".json"):
+                        files.append(key)
+            logger.info(f"Found {len(files)} json(.gz) files in s3://{bucket}/{prefix}")
+            return files
+        except Exception as e:
+            logger.error(f"Error listing S3 objects from s3://{bucket}/{prefix}: {e}")
+            traceback.print_exc()
+            raise
+
+    def get_object_body(self, bucket, key):
+        """
+        Return StreamingBody for the object; caller will read/decompress.
+        """
+        try:
+            response = self._client.get_object(Bucket=bucket, Key=key)
+            return response["Body"]
+        except Exception as e:
+            logger.error(f"Error fetching S3 object {key} from {bucket}: {e}")
+            traceback.print_exc()
+            raise
+
+
+----------------------------------------------
+
+
+dynamodb
+
+# src/main/python/dynamodb_srv.py
+import boto3
+import json
+import gzip
+import logging
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from boto3.dynamodb.types import TypeDeserializer
+
+from src.main.python.s3_srv import S3Service
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+deserializer = TypeDeserializer()
+
+
+def deserialize_item(dynamo_json):
+    """
+    Convert DynamoDB wire-format attribute map to plain Python dict.
+    """
+    return {k: deserializer.deserialize(v) for k, v in dynamo_json.items()}
+
+
+class DynamoDBService:
+    def __init__(self, session):
+        """
+        session: boto3.Session already created with appropriate region / credentials
+        """
+        self._session = session
+        self._dynamodb = session.resource("dynamodb")
+        logger.info(f"DynamoDBService initialized for region: {getattr(session, 'region_name', 'unknown')}")
+
+    def _read_items_from_body(self, body_stream, key):
+        """
+        Read StreamingBody bytes and return list of items.
+        Handles .json.gz (newline JSON per line) or plain JSON array or newline JSON.
+        """
+        try:
+            raw_bytes = body_stream.read()
+            # Try gz first (if content is gz)
+            try:
+                decoded = gzip.decompress(raw_bytes).decode("utf-8")
+            except OSError:
+                # not gz
+                decoded = raw_bytes.decode("utf-8")
+
+            decoded = decoded.strip()
+            if not decoded:
+                return []
+
+            # If it's a JSON array
+            if decoded.startswith("["):
+                return json.loads(decoded)
+
+            # Else treat as newline-separated JSON objects
+            lines = [ln for ln in decoded.splitlines() if ln.strip()]
+            items = [json.loads(ln) for ln in lines]
+            return items
+        except Exception:
+            logger.error(f"Failed to read/parse S3 object {key}")
+            traceback.print_exc()
+            raise
+
+    def _import_items_to_table(self, table, items, batch_size=100):
+        """
+        Write items to DynamoDB table using batch_writer.
+        Accepts items that are either:
+          - {'Item': {dynamo-wire-format}} (from DynamoDB export) OR
+          - plain JSON map already (target format)
+        Returns number of items written.
+        """
+        written = 0
+        try:
+            for i in range(0, len(items), batch_size):
+                chunk = items[i : i + batch_size]
+                with table.batch_writer() as batch:
+                    for raw in chunk:
+                        try:
+                            if isinstance(raw, dict) and "Item" in raw:
+                                item = deserialize_item(raw["Item"])
+                            else:
+                                item = raw
+                            batch.put_item(Item=item)
+                            written += 1
+                        except KeyError:
+                            logger.error(f"Missing 'Item' key in record: {raw}")
+                        except Exception:
+                            logger.error(f"Failed to put item {raw}")
+                            traceback.print_exc()
+                            raise
+            return written
+        except Exception:
+            logger.error("Batch write failed; aborting.")
+            raise
+
+    def _process_single_file(self, s3_service, bucket, key, table, file_ext, retry=True):
+        """
+        Download, parse, import single S3 file. Retries once by refreshing session if retry=True.
+        """
+        try:
+            body = s3_service.get_object_body(bucket, key)
+            items = self._read_items_from_body(body, key)
+            if not items:
+                logger.warning(f"No items in {key}; skipping.")
+                return 0
+            written = self._import_items_to_table(table, items)
+            logger.info(f"Restored {written} items from {key}")
+            return written
+        except Exception as e:
+            logger.warning(f"Error processing {key}: {e}")
+            traceback.print_exc()
+            if not retry:
+                raise
+            # retry: recreate session & s3 service (refresh creds) once
+            try:
+                logger.info("Retrying once after refreshing session...")
+                new_session = boto3.session.Session(region_name=self._session.region_name)
+                new_s3_service = S3Service(new_session)
+                body = new_s3_service.get_object_body(bucket, key)
+                items = self._read_items_from_body(body, key)
+                written = self._import_items_to_table(table, items)
+                logger.info(f"(retry) Restored {written} items from {key}")
+                return written
+            except Exception:
+                logger.error(f"Retry failed for file {key}")
+                traceback.print_exc()
+                raise
+
+    def restore_mrsc(self, args):
+        """
+        High-level entry: args must provide:
+          - region (string)
+          - s3_bucket, s3_prefix, target_table, file_extension, batch_size, max_workers
+        This function will raise on any critical error (so caller/pipeline fails).
+        """
+        region = args.region
+        s3_bucket = args.s3_bucket
+        s3_prefix = args.s3_prefix
+        target_table_name = args.target_table
+        file_ext = getattr(args, "file_extension", ".json.gz")
+        batch_size = getattr(args, "batch_size", 100)
+        max_workers = getattr(args, "max_workers", 3)
+
+        logger.info(f"Starting MRSC restore: table={target_table_name}, bucket={s3_bucket}, prefix={s3_prefix}")
+
+        # Use the session given at creation time; session.region_name should be set by caller
+        s3_service = S3Service(self._session)
+        table = self._dynamodb.Table(target_table_name)
+
+        # list files
+        files = s3_service.list_json_gz_files(s3_bucket, s3_prefix)
+        if not files:
+            logger.error("No export files found to restore - aborting.")
+            raise RuntimeError("No export files found to restore.")
+
+        logger.info(f"{len(files)} files found. Processing with {max_workers} workers...")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._process_single_file, s3_service, s3_bucket, key, table, file_ext): key for key in files}
+            for fut in as_completed(futures):
+                key = futures[fut]
+                try:
+                    res = fut.result()
+                    logger.info(f"Completed {key}: restored {res} items")
+                except Exception as e:
+                    logger.error(f"Failed processing file {key}: {e}")
+                    # re-raise to ensure pipeline fails
+                    raise
+
+        logger.info("MRSC restore completed successfully.")
+--------------------------------------------
+
+
+argument
+
+# src/main/python/argument_manager.py
+def register_restore_mrsc_arguments(parser):
+    grp = parser.add_argument_group("Restore MRSC Options")
+    grp.add_argument("--region", type=str, required=True, help="AWS region where the MRSC table exists")
+    grp.add_argument("--s3-bucket", type=str, required=True, help="S3 bucket storing exports")
+    grp.add_argument("--s3-prefix", type=str, required=True, help="S3 prefix (folder) for export files")
+    grp.add_argument("--target-table", type=str, required=True, help="Target MRSC-enabled DynamoDB table")
+    grp.add_argument("--file-extension", type=str, default=".json.gz", help="Export file extension (default .json.gz)")
+    grp.add_argument("--batch-size", type=int, default=100, help="DynamoDB batch size (default 100)")
+    grp.add_argument("--max-workers", type=int, default=3, help="Parallel workers (default 3)")
+--------------------------------------------
+
+command_manager
+
+# src/main/python/command_manager.py
+from src.main.python.argument_manager import register_restore_mrsc_arguments
+
+class Command:
+    DDB_RESTORE_MRSC = "restore-mrsc"
+
+REGISTER_ARGUMENTS_MAP = {
+    Command.DDB_RESTORE_MRSC: register_restore_mrsc_arguments
+}
+
+------------------------
+
+python main.py --region us-east-1 --s3-bucket my-bucket --s3-prefix my/prefix --target-table my-table
+
+
+-----------------------------------
+
