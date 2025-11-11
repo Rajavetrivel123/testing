@@ -1,0 +1,140 @@
+* No `count` argument.
+* Designed for import (so Terraform can detect multiple lifecycle rules).
+* Fully compatible with import commands like:
+
+  ```bash
+  tofu import aws_s3_bucket_lifecycle_configuration.s3_lifecycle_configuration my-bucket-name
+  ```
+
+---
+
+### New Terraform Template (Without `count`)
+
+```hcl
+locals {
+  bucket_env     = lower(var.CloudEnvironment)
+  bucket_region  = lower(var.region)
+  lifecycleRules = var.lifecycle_rules
+
+  s3_bucket_name = local.bucket_env == "prod" ? "${var.bucket_name}-prd" : local.bucket_env == "stage" ? "${var.bucket_name}-stg" : local.bucket_env == "dev" ? "${var.bucket_name}-dev" : var.bucket_name
+}
+
+resource "aws_s3_bucket" "this" {
+  bucket = local.s3_bucket_name
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "s3_lifecycle_configuration" {
+  bucket = aws_s3_bucket.this.id
+
+  rule = [
+    for rule in var.lifecycle_rules : {
+      id     = rule["rule_name"]
+      status = rule["status"]
+
+      filter = length(compact([
+        rule["filter_prefix"] != null ? rule["filter_prefix"] : null,
+        rule["filter_tags"] != null ? rule["filter_tags"] : null
+      ])) > 0 ? {
+        prefix = lookup(rule, "filter_prefix", null)
+        tags   = lookup(rule, "filter_tags", null)
+      } : null
+
+      expiration = can(rule["expiration_days"]) ? {
+        days = rule["expiration_days"]
+      } : can(rule["expiration_date"]) ? {
+        date = rule["expiration_date"]
+      } : can(rule["expired_object_delete_marker"]) ? {
+        expired_object_delete_marker = rule["expired_object_delete_marker"]
+      } : null
+
+      transition = can(rule["transition_days"]) ? [
+        {
+          days          = rule["transition_days"]
+          storage_class = rule["transition_storage_class"]
+        }
+      ] : can(rule["noncurrent_transition_days"]) ? [
+        {
+          noncurrent_days          = rule["noncurrent_transition_days"]
+          storage_class            = rule["noncurrent_transition_storage_class"]
+        }
+      ] : []
+
+      noncurrent_version_expiration = can(rule["noncurrent_expiration_days"]) ? {
+        noncurrent_days = rule["noncurrent_expiration_days"]
+      } : null
+
+      abort_incomplete_multipart_upload = can(rule["abort_multipart_days_after_initiation"]) ? {
+        days_after_initiation = rule["abort_multipart_days_after_initiation"]
+      } : null
+    }
+  ]
+}
+```
+
+---
+
+###Key Differences from Your Original (with `count`)
+
+| Feature                            | Old Template (With Count)                            | New Template (Without Count)       |
+| ---------------------------------- | ---------------------------------------------------- | ---------------------------------- |
+| `count` argument                   |  Present (`count = local.enable_lifecycle ? 1 : 0`) |  Removed                          |
+| Resource name                      | `"this"`                                             | `"s3_lifecycle_configuration"`     |
+| Import behavior                    | Harder to import (due to count)                      | Easier to import                   |
+| Supports multiple rules per bucket | Yes                                                | Yes                              |
+| Recommended usage                  | Normal pipeline deployment                           | Manual or scripted import use case |
+
+---
+
+###How to Use for Import
+
+After adding this new `.tf` file, you can import your existing lifecycle configuration using:
+
+```bash
+tofu import aws_s3_bucket_lifecycle_configuration.s3_lifecycle_configuration my-bucket-name
+```
+
+If your bucket has **multiple lifecycle rules**, this single resource will handle them automatically
+(because `rule = [ for rule in var.lifecycle_rules : { ... } ]` already loops through all rules).
+
+---
+
+###Example for `var.lifecycle_rules`
+
+To make import testing easier, here’s an example variable file:
+
+```hcl
+lifecycle_rules = [
+  {
+    rule_name                = "expire-old-logs"
+    status                   = "Enabled"
+    filter_prefix            = "logs/"
+    expiration_days          = 30
+  },
+  {
+    rule_name                = "transition-archive"
+    status                   = "Enabled"
+    filter_prefix            = "archive/"
+    transition_days          = 60
+    transition_storage_class = "GLACIER"
+  },
+  {
+    rule_name                = "abort-multipart"
+    status                   = "Enabled"
+    abort_multipart_days_after_initiation = 7
+  }
+]
+```
+
+---
+
+### Summary
+
+| Purpose            | File                         | Resource Name                                                      | count | Import Command                                                                             |
+| ------------------ | ---------------------------- | ------------------------------------------------------------------ | ----- | ------------------------------------------------------------------------------------------ |
+| Deployment version | `s3_lifecycle_with_count.tf` | `aws_s3_bucket_lifecycle_configuration.this`                       | Yes | Not suitable                                                                               |
+| Import version     | `s3_lifecycle_import.tf`     | `aws_s3_bucket_lifecycle_configuration.s3_lifecycle_configuration` | No  | `tofu import aws_s3_bucket_lifecycle_configuration.s3_lifecycle_configuration my-bucket` |
+
+---
+
+Would you like me to add a **variable block and example module call** for this new import version (so you can just copy-paste into your import pipeline module)?
+That will make it plug-and-play for you.
